@@ -1,0 +1,10 @@
+/target
+framework_out
+testtmp
+keypair
+docs.redb
+.DS_Store
+peers.postcard
+blobs
+bindings
+scratch_data

@@ -1,0 +1,44 @@
+[package]
+name = "ghostlib"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "ghostlib"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[[bin]]
+# This can be whatever name makes sense for your project, but the rest of this tutorial assumes uniffi-bindgen.
+name = "uniffi-bindgen"
+path = "uniffi-bindgen.rs"
+
+[[bin]]
+name = "scratch"
+path = "src/scratch.rs"
+
+#[[bin]]
+#name = "clock"
+#path = "src/clock.rs"
+
+[dependencies]
+anyhow = "1.0.82"
+iroh = { path = "../iroh/iroh", features = [] }
+serde = { version = "1.0.200", features = ["serde_derive"] }
+thiserror = "1.0.59"
+tokio = { version = "1.37.0", features = ["rt-multi-thread", "sync"] }
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+uniffi = { version = "0.27.1", features=["cli"] }
+chrono = { version = "0.4.37", features = ["serde"] }
+fallible-iterator = "0.3.0"
+futures = "0.3.30"
+futures-util = "0.3.30"
+quic-rpc = "0.8.0"
+flexbuffers = "2.0.0"
+
+[build-dependencies]
+uniffi_build = "0.27.1"
+uniffi_bindgen = "0.27.1"
+
+
+[patch.crates-io]
+reqwest = { path = '../reqwest' }
