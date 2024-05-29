@@ -1,9 +1,6 @@
-use std::ptr::write;
 use std::sync::Arc;
-use fallible_iterator::FallibleIterator;
 use tokio::runtime::Handle;
 use tokio::sync::RwLock;
-use crate::data::WideId;
 use crate::dispatch::{AsyncMessageDispatch, EventSender, EventWrapper};
 use crate::dispatch::establish_connection::EstablishConnectionEvents::{AttemptingJoin, ConnectionConfirmed, ConnectionEstablished, ConnectionRejected, JoinTicketGenerated};
 use crate::dispatch::EventWrapper::Event;
@@ -120,7 +117,7 @@ async fn action(ctx: Arc<Context>, action: EstablishConnectionActions, tx: Event
         EstablishConnectionActions::RejectConnection => {
             let mut write_guard = ctx.ex_ctx.write().await;
             let exctx = (*write_guard).take().unwrap();
-            ctx.exchange.shutdown().await?;
+            exctx.shutdown().await?;
             tx.send(Event(ConnectionRejected)).await?;
 
         }

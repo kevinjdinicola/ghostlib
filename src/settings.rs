@@ -1,10 +1,9 @@
-use std::fs;
+
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
-use iroh::sync::NamespaceId;
+use iroh::docs::NamespaceId;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::OnceCell;

@@ -1,6 +1,4 @@
 use std::sync::Arc;
-use fallible_iterator::FallibleIterator;
-
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::Sender;
 use crate::data::{ExchangeId, WideId};
@@ -138,7 +136,7 @@ async fn create_identity(name: String, ctx: Arc<Context>, tx: &Sender<EventWrapp
     start(ctx, tx).await
 }
 
-async fn delete_exchange(ex_id: ExchangeId, ctx: Arc<Context>, tx: &Sender<EventWrapper<GlobalEvents>>) -> anyhow::Result<()> {
+async fn delete_exchange(ex_id: ExchangeId, ctx: Arc<Context>, _tx: &Sender<EventWrapper<GlobalEvents>>) -> anyhow::Result<()> {
     ctx.exchange.delete_exchange(ex_id).await?;
 
     Ok(())

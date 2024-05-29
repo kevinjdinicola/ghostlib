@@ -3,8 +3,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::Relaxed;
-use fallible_iterator::FallibleIterator;
 
+use anyhow::Result;
 use tokio::runtime::{Handle, Runtime};
 use tokio::sync::RwLock;
 
@@ -23,6 +23,7 @@ pub mod settings;
 pub mod data;
 pub mod identity;
 pub mod exchange;
+mod live_doc;
 
 //
 // some kind of root context to host the initialized rust app and
@@ -163,17 +164,21 @@ impl AppHost {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::future::Future;
+    use std::pin::Pin;
     use std::time::Duration;
-    use fallible_iterator::FallibleIterator;
 
+    use anyhow::anyhow;
+    use futures_util::TryFutureExt;
     use iroh::base::node_addr::AddrInfoOptions;
     use iroh::base::ticket::Ticket;
-    use iroh::net::dns::node_info::NodeInfo;
+    use iroh::client::docs::ShareMode::Write;
+    use iroh::docs::DocTicket;
+    use tokio::select;
+    use tokio::sync::broadcast::Receiver;
 
-    use iroh::rpc_protocol::ShareMode::Write;
-
-    use crate::data::{ExchangeId, PublicKey, SerializingBlobsClient, WideId};
-    use crate::exchange::{ContextEvents as ExchangeEvents, ContextEvents, Message};
+    use crate::data::{BlobsSerializer, ExchangeId, PublicKey};
+    use crate::exchange::{ContextEvents, ExchangeContext, Message};
     use crate::identity::Identification;
 
     // Note this useful idiom: importing names from outer (for mod tests) scope.
@@ -190,6 +195,35 @@ mod tests {
         }
     }
 
+    // type AsyncPredicate<T, O> = fn(&T) -> Pin<Box<dyn Future<Output = Option<O>> + Send>>;
+    async fn receive_until_match<T, O, F, Fut, X>(mut rx: Receiver<T>, context: X, check: F) -> Result<O>
+    where
+        T: Clone + Send + 'static,
+        O: Send + 'static,
+        F: Fn(T, X) -> Fut + Send + 'static,
+        Fut: Future<Output = Option<O>> + Send,
+        X: Send + Clone + 'static
+    {
+        let jh = tokio::spawn(async move {
+            let (timeout_tx, mut timeout_rx) = tokio::sync::mpsc::channel(1);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(5000)).await;
+                timeout_tx.send(()).await.expect("fuck");
+            });
+            loop {
+                select! {
+                    Some(()) = timeout_rx.recv() => return Err(anyhow!("timeout")),
+                    Ok(val) = rx.recv() => {
+                        if let Some(outval) = check(val, context.clone()).await {
+                            return Ok(outval)
+                        }
+                    }
+                }
+            }
+        });
+        jh.await?
+    }
+
     #[test]
     fn will_delete_all_data() {
         wipe_test_dir(None);
@@ -202,87 +236,6 @@ mod tests {
         assert!(matches!(fs::metadata(TEST_DIR), Err(_)))
 
     }
-
-
-    use futures_util::StreamExt;
-    use iroh::net::magic_endpoint::ConnectionInfo;
-    use iroh::net::NodeAddr;
-    use iroh::sync::PeerIdBytes;
-
-    #[test]
-    fn plz() {
-        // wipe_test_dir(None);
-        // fs::create_dir(TEST_DIR).unwrap();
-        let ah = AppHost::new(AppConfig { data_path: TEST_DIR.into() } );
-        let r: anyhow::Result<()> = ah.handle().block_on(async {
-            ah.identity.load_assumed_identity().await?;
-            ah.exchange.reload_contexts(None, None).await?; //autmate
-            let ctxs = ah.exchange.contexts().await;
-            // println!("i have {:?}", ctxs.len());
-            //
-            // tokio::time::sleep(Duration::from_millis(2000)).await;
-            //
-            // let iden = ah.identity.create_identification("TESTTTTT").await?;
-            // let ticket = "docaaacaobf3xdntefygxnxix5kucvci6texjprv4qorwokv3stgvk2trhtagmhbffn4safwbqohcbjhy4k3wqbc632c6bzzq6dyg4hnatsspcdoaadaafaaam2yrlqacqaaib4ivyaf6lyho6ek4";
-            // let ex = ah.exchange.join_exchange(ticket, true).await?;
-
-
-            // let ctxs = ah.exchange.contexts().await;
-            // println!("i have {:?}", ctxs.len());
-
-
-            // let ex = ctxs.get(0).unwrap();
-
-            // let doc = &ex.doc;
-            // let fuck = ah.node.read().await;
-            // let node = (&*fuck).as_ref().unwrap().clone();
-            // let mut stream = node.node.connections().await?;
-            //
-            // println!("NODE CONN INFO");
-            // while let Some(Ok(e)) = stream.next().await {
-            //     let e: ConnectionInfo = e;
-            //     println!("node id {}, dr addrs {:?}", e.node_id, e.addrs)
-            // }
-            //
-            // if let Some(peers) = doc.get_sync_peers().await? {
-            //     println!("DOC SYNC PEERS");
-            //     for p in peers {
-            //         let thing: [u8; 32] = p;
-            //         println!("peer id in bytes {:?}", p);
-            //         println!("peer id wide: {}", WideId::from(thing));
-            //     }
-            //
-            // }
-
-
-
-            // let peer: [u8; 32] = [152, 112, 148, 173, 228, 128, 91, 6, 14, 56, 130, 147, 227, 138, 221, 160, 17, 123, 122, 23, 131, 156, 195, 195, 193, 184, 118, 130, 114, 147, 196, 55];
-            // let pk = iroh::net::key::PublicKey::from_bytes(&peer)?;
-            // let nodeaddr = NodeAddr::new(pk);
-            // ex.doc.start_sync(vec![nodeaddr]).await?;
-
-            tokio::time::sleep(Duration::from_millis(5000)).await;
-            // let mut subby = ex.subscribe();
-            // while let Ok(e) = subby.recv().await {
-            //     match e {
-            //         ContextEvents::Loaded => {
-            //             println!("loaded?")
-            //         }
-            //         ContextEvents::Join(joiner) => {
-            //             println!("joined: {joiner}");
-            //             break;
-            //         }
-            //         ContextEvents::MessageReceived(msg) => {
-            //             println!("msg: {}", msg.text);
-            //         }
-            //     }
-            // };
-
-            Ok(())
-        });
-        ah.shutdown();
-    }
-
 
     #[test]
     fn can_create_and_reload_data() {
@@ -356,64 +309,35 @@ mod tests {
     #[test]
     fn creator() {
         wipe_test_dir(None);
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        let abort_tx = tx.clone();
         // first
         let ah = AppHost::new(AppConfig { data_path: TEST_DIR.into() } );
 
-        // setup aborter
-        ah.handle().spawn(async move {
-            tokio::time::sleep(Duration::from_millis(10000)).await;
-            abort_tx.send("timeout".into()).await
-        });
-
-        let token = ah.handle().block_on(async {
+        let (token, result) = ah.handle().block_on(async {
             ah.identity.create_identification("kevin").await.unwrap();
             let ex = ah.exchange.create_exchange(true ).await.unwrap();
 
-
             let tkn = ex.generate_join_ticket().await.expect("failed to generate join ticket");
 
-            let mut listener = ex.subscribe();
-            let ex_clone = ex.clone();
-            ah.handle().spawn(async move {
-                let ex = ex_clone;
-                match listener.recv().await {
-                    Ok(ExchangeEvents::Join(pk)) => {
-                        let found = ex.participants().await.into_iter().find(|p| {
+            let result = receive_until_match(ex.subscribe(), ex, |e: ContextEvents, context: ExchangeContext| async move {
+                match e {
+                    ContextEvents::Join(pk) => {
+                        let found = context.participants().await.into_iter().find(|p| {
                             p.public_key() == &pk
                         });
-                        match found {
-                            None => { }
-                            Some(i) => {
-                                tx.send(String::from(i.name())).await.unwrap();
-                            }
-                        };
-                    },
-                    Ok(_) => { },
-                    Err(..) => { }
+                        found
+                    }
+                    _ => { None }
                 }
             });
-            tkn
-        });
 
-        let jh = ah.handle().spawn(async move {
-           match rx.recv().await {
-               Some(str) => {
-                   str
-               }
-               None => {
-                   String::from("err")
-               }
-           }
+            (tkn, result)
         });
 
         println!("alright lets interact with it");
-        use iroh::ticket::DocTicket;
 
         ah.handle().block_on(async {
             let node: iroh::node::MemNode = iroh::node::Node::memory().spawn().await.unwrap();
-            let dt: DocTicket = iroh::base::ticket::Ticket::deserialize(&token).unwrap();
+            let dt: DocTicket = Ticket::deserialize(&token).unwrap();
             let doc = node.docs.import(dt).await.unwrap();
             let author = node.authors.create().await?;
             let pk: PublicKey = author.into();
@@ -421,15 +345,15 @@ mod tests {
                 public_key: pk,
                 name: String::from("hurshal")
             };
-            let blob_add = node.blobs.serialize_write_blob(iden).await?;
+            let blob_add = node.serialize_write_blob(iden).await?;
             doc.set_hash(author, String::from("identification"), blob_add.hash, blob_add.size).await?;
             Ok::<(), anyhow::Error>(())
         }).unwrap();
 
 
-        let str = ah.handle().block_on(jh).unwrap();
+        let iden: Result<Identification> = ah.handle().block_on(result);
         ah.shutdown();
-        assert_eq!(str, "hurshal");
+        assert_eq!(iden.unwrap().name, "hurshal");
 
     }
 
@@ -457,7 +381,7 @@ mod tests {
                 public_key: pk,
                 name: String::from("hurshal")
             };
-            let blob_add = node.blobs.serialize_write_blob(iden).await?;
+            let blob_add = node.serialize_write_blob(iden).await?;
             doc.set_hash(author, String::from("identification"), blob_add.hash, blob_add.size).await?;
             let ticket = doc.share(Write, AddrInfoOptions::Addresses).await?.serialize();
             Ok::<String, anyhow::Error>(ticket)
@@ -470,36 +394,49 @@ mod tests {
             }
         });
 
-        ah.handle().block_on(async {
+        let res = ah.handle().block_on(async {
             ah.identity.create_identification("kevin").await?;
             let ex = ah.exchange.join_exchange(&ticket, true).await?;
 
-            let mut listener = ex.subscribe();
-            let ex_clone = ex.clone();
-            ah.handle().spawn(async move {
-                let ex = ex_clone;
-                match listener.recv().await {
-                    Ok(ExchangeEvents::Join(pk)) => {
-                        let found = ex.participants().await.into_iter().find(|p| {
+            receive_until_match(ex.subscribe(), ex, |e: ContextEvents, context: ExchangeContext| async move {
+                match e {
+                    ContextEvents::Join(pk) => {
+                        let found = context.participants().await.into_iter().find(|p| {
                             p.public_key() == &pk
                         });
-                        match found {
-                            None => { }
-                            Some(i) => {
-                                tx.send(String::from(i.name())).await.unwrap();
-                            }
-                        };
-                    },
-                    Ok(_) => { },
-                    Err(..) => { }
+                        found
+                    }
+                    _ => { None }
                 }
-            });
-            Ok::<(), anyhow::Error>(())
-        }).unwrap();
+            }).await
 
-        let str = ah.handle().block_on(jh).unwrap();
+            //
+            // let mut listener = ex.subscribe();
+            // let ex_clone = ex.clone();
+            // ah.handle().spawn(async move {
+            //     let ex = ex_clone;
+            //     match listener.recv().await {
+            //         Ok(ExchangeEvents::Join(pk)) => {
+            //             let found = ex.participants().await.into_iter().find(|p| {
+            //                 p.public_key() == &pk
+            //             });
+            //             match found {
+            //                 None => { }
+            //                 Some(i) => {
+            //                     tx.send(String::from(i.name())).await.unwrap();
+            //                 }
+            //             };
+            //         },
+            //         Ok(_) => { },
+            //         Err(..) => { }
+            //     }
+            // });
+            // Ok::<(), anyhow::Error>(())
+        });
+
+        // let str = ah.handle().block_on(jh).unwrap();
         ah.shutdown();
-        assert_eq!(str, "hurshal");
+        assert_eq!(res.unwrap().name, "hurshal");
         println!("Success!");
         drop(ah);
 
@@ -582,6 +519,7 @@ mod tests {
                        ContextEvents::MessageReceived(m) => {
                            tx.send(m.text).await.unwrap();
                        }
+                       ContextEvents::LiveConnectionsUpdated(_) => {}
                    }
                }
             });

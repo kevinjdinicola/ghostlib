@@ -5,23 +5,18 @@ use std::{fmt, ptr};
 use std::fmt::{Debug, Display, Formatter};
 
 use anyhow::anyhow;
-use iroh::base32;
-use iroh::bytes::Hash;
-use iroh::client::{BlobAddOutcome, BlobsClient, Doc as IrohDoc};
-use iroh::node::Node as IrohNode;
-use iroh::rpc_protocol::{ProviderRequest, ProviderResponse, ProviderService};
-use iroh::sync::{AuthorId, NamespaceId};
-use iroh::sync::store::Query;
-use quic_rpc::ServiceConnection;
-use quic_rpc::transport::flume::FlumeConnection;
+use iroh::base::base32;
+use iroh::blobs::Hash;
+use iroh::client::blobs::AddOutcome;
+use iroh::docs::{AuthorId, NamespaceId};
+use iroh::docs::store::Query;
+use iroh::node::FsNode;
 use serde::{Deserialize, Serialize};
-use uniffi::export;
-
 
 // global 'store' type for how im dealing with nodes everywhere
-pub type Store = iroh::bytes::store::fs::Store;
-pub type Node = IrohNode<Store>;
-pub type Doc = IrohDoc<FlumeConnection<ProviderResponse, ProviderRequest>>;
+
+pub type Node = FsNode;
+pub type Doc = iroh::client::MemDoc;
 
 
 // #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Hash, Clone, Copy)]
@@ -130,38 +125,36 @@ pub async fn load_from_doc_at_key<T: for<'a> Deserialize<'a>>(node: &Node, doc: 
     } else {
         doc.get_one(Query::key_exact(key)).await?.ok_or_else(|| anyhow!("not here"))?
     };
-    Ok(node.blobs.deserialize_read_blob(e.content_hash()).await?)
+    Ok(node.deserialize_read_blob(e.content_hash()).await?)
 }
 pub async fn save_on_doc_as_key<T: Serialize>(node: &Node, doc: &Doc, pk: &PublicKey, key: &str, data: T) -> anyhow::Result<()> {
-    let new_data = node.blobs.serialize_write_blob(data).await?;
+    let new_data = node.serialize_write_blob(data).await?;
     doc.set_hash(pk.into(), String::from(key), new_data.hash, new_data.size).await?;
     Ok(())
 }
 #[allow(async_fn_in_trait)]
-pub trait SerializingBlobsClient {
+pub trait BlobsSerializer {
 
     async fn deserialize_read_blob<T: for<'a> Deserialize<'a>>(&self, hash: Hash) -> anyhow::Result<T>;
 
-    async fn serialize_write_blob<T: Serialize>(&self, data: T) -> anyhow::Result<BlobAddOutcome>;
+    async fn serialize_write_blob<T: Serialize>(&self, data: T) -> anyhow::Result<AddOutcome>;
 }
 
-impl<C> SerializingBlobsClient for BlobsClient<C>
-    where
-        C: ServiceConnection<ProviderService>,
-{
+impl<C> BlobsSerializer for iroh::node::Node<C> {
     async fn deserialize_read_blob<T: for<'a> Deserialize<'a>>(&self, hash: Hash) -> anyhow::Result<T> {
-        let bytes = self.read_to_bytes(hash).await?;
+        let bytes = self.blobs.read_to_bytes(hash).await?;
         let r = flexbuffers::Reader::get_root(bytes.iter().as_slice()).unwrap();
         let decoded = T::deserialize(r).expect("Deserialization failed");
         Ok(decoded)
     }
 
-    async fn serialize_write_blob<T: Serialize>(&self, data: T) -> anyhow::Result<BlobAddOutcome> {
+    async fn serialize_write_blob<T: Serialize>(&self, data: T) -> anyhow::Result<AddOutcome> {
         let mut s = flexbuffers::FlexbufferSerializer::new();
         data.serialize(&mut s).expect("Serialization failure");
-        self.add_bytes(s.take_buffer()).await
+        self.blobs.add_bytes(s.take_buffer()).await
     }
 }
+
 
 
 

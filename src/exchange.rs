@@ -1,6 +1,7 @@
 use std::cmp::PartialEq;
 use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
+use std::str::Utf8Error;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Result};
@@ -8,24 +9,24 @@ use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use iroh::base::node_addr::AddrInfoOptions;
 use iroh::base::ticket::Ticket;
-use iroh::bytes::Hash;
-use iroh::client::{Entry, LiveEvent};
+use iroh::blobs::Hash;
+use iroh::client::docs::{Entry, LiveEvent};
+use iroh::client::docs::ShareMode::Write;
+use iroh::docs::{ContentStatus, DocTicket};
+use iroh::docs::store::Query;
 use iroh::net::NodeAddr;
-use iroh::rpc_protocol::ShareMode::Write;
-use iroh::sync::ContentStatus;
-use iroh::sync::store::Query;
-use iroh::ticket::DocTicket;
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio::sync::broadcast::{Receiver, Sender};
 use tokio::sync::broadcast::error::SendError;
 
-use crate::data::{Doc, ExchangeId, load_from_doc_at_key, Node, PublicKey, save_on_doc_as_key, SerializingBlobsClient, WideId};
+use crate::data::{Doc, ExchangeId, load_from_doc_at_key, Node, PublicKey, save_on_doc_as_key, BlobsSerializer};
 use crate::exchange::ContextEvents::Loaded;
 use crate::exchange::Events::ExchangeListDidUpdate;
 use crate::exchange::ExchangeManifest::MutualBinary;
 use crate::identity::{Identification, Service as IdentityService};
+use crate::live_doc::{ContentReadyProcessor, IdentificationReadWriter, LiveActorEvent, LiveEventActor, MessagesReadWriter};
 use crate::settings::Service as SettingsService;
 
 // lives on exchange doc
@@ -67,7 +68,10 @@ pub struct ExchangeContextInner {
     broadcast: Sender<ContextEvents>,
     participants: RwLock<Vec<Identification>>,
     messages: RwLock<Vec<Message>>,
-    connected: RwLock<HashSet<iroh::net::key::PublicKey>>,
+    connected: RwLock<HashSet<PublicKey>>,
+    identification_rw: IdentificationReadWriter,
+    messages_rw: MessagesReadWriter,
+
 }
 
 #[derive(Clone, Debug)]
@@ -84,6 +88,18 @@ fn make_message_key(message: &Message) -> String {
 
 impl ExchangeContext {
     pub fn new(id: ExchangeId, doc: Doc, node: Node) -> ExchangeContext {
+
+        let identification_rw: IdentificationReadWriter = IdentificationReadWriter {
+            key_path: IDENTIFICATION_KEY,
+            doc: doc.clone(),
+            node: node.clone(),
+        };
+        let messages_rw: MessagesReadWriter = MessagesReadWriter {
+            key_prefix: MESSAGE_KEY_PREFIX,
+            doc: doc.clone(),
+            node: node.clone()
+        };
+
         let (tx, _rx): (Sender<ContextEvents>, Receiver<ContextEvents>) = broadcast::channel(16);
         // start streaming and shit?
         let ectx = ExchangeContext(Arc::new(ExchangeContextInner {
@@ -94,13 +110,85 @@ impl ExchangeContext {
             broadcast: tx,
             participants: RwLock::new(vec![]),
             messages: RwLock::new(vec![]),
-            connected: RwLock::new(HashSet::new())
+            connected: RwLock::new(HashSet::new()),
+            identification_rw,
+            messages_rw
         }));
 
         ectx
     }
 
-    pub fn start(&self) {
+    pub async fn start_2(&self) -> Result<()> {
+        let (tx, mut rx) = mpsc::channel(16);
+        let idrw: IdentificationReadWriter = IdentificationReadWriter {
+            key_path: IDENTIFICATION_KEY,
+            doc: self.doc.clone(),
+            node: self.node.clone(),
+        };
+        let mrw: MessagesReadWriter = MessagesReadWriter {
+            key_prefix: MESSAGE_KEY_PREFIX,
+            doc: self.doc.clone(),
+            node: self.node.clone()
+        };
+
+        // participants
+        let mut participants = idrw.get_all().await?;
+        println!("got {} from experimentalt thing", {participants.len()});
+        let mut parts_write_guard = self.participants.write().await;
+        (*parts_write_guard).append(&mut participants);
+        drop(parts_write_guard);
+
+        // messages
+        let mut msgs_write_guard = self.messages.write().await;
+        let mut saved_msgs = mrw.get_all().await?;
+        (*msgs_write_guard).append(&mut saved_msgs);
+        (*msgs_write_guard).sort_by_key(|m| m.date);
+        drop(msgs_write_guard);
+
+        self.broadcast(Loaded).await?;
+
+
+        let ld = LiveEventActor::new(tx);
+        // this just eats itself and dies when subscribe dies
+        ld.run(&self.doc).await?;
+        let self2 = self.clone();
+
+        tokio::spawn(async move {
+            println!("inside new worker loop");
+            while let Some(e) = rx.recv().await {
+                println!("received event in wl {:?}", e);
+                match e {
+                    LiveActorEvent::ContentReady(entry) => {
+                        let key = std::str::from_utf8(entry.key())?;
+
+                        if let Some(iden) = idrw.content_ready(key, &entry).await? {
+                            self2.new_participant_joined(iden).await?;
+                        } else if let Some(msg) = mrw.content_ready(key, &entry).await? {
+                            self2.new_message_received(msg).await?
+                        }
+                    }
+                    LiveActorEvent::NeighborUp(pk) => {
+                        let mut write_guard = self2.connected.write().await;
+                        (*write_guard).insert(pk);
+                        let count = write_guard.len();
+                        drop(write_guard);
+                        self2.broadcast(ContextEvents::LiveConnectionsUpdated(count)).await?;
+                    }
+                    LiveActorEvent::NeighborDown(pk) => {
+                        let mut write_guard = self2.connected.write().await;
+                        (*write_guard).remove(&pk);
+                        let count = write_guard.len();
+                        drop(write_guard);
+                        self2.broadcast(ContextEvents::LiveConnectionsUpdated(count)).await?;
+                    }
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        });
+
+        Ok(())
+    }
+    pub async fn start(&self) -> Result<()> {
         let worker = self.clone();
         Handle::current().spawn(async move {
             match worker.worker_loop().await {
@@ -112,6 +200,7 @@ impl ExchangeContext {
                 }
             }
         });
+        Ok(())
     }
 
     // pub fn shutdown(&self) {
@@ -150,9 +239,10 @@ impl ExchangeContext {
     async fn broadcast(&self, event: ContextEvents) -> Result<usize, SendError<ContextEvents>> {
         // todo will this ever race condition? should i just catch errors?
         if self.broadcast.receiver_count() > 0 {
+            println!("broadcasting {:?}", event);
            self.broadcast.send(event)
         } else {
-            println!("not sending cuz no ones listening");
+            println!("Tried to broadcast, but no one is listening {:?}", event);
             Ok(0)
         }
     }
@@ -182,48 +272,43 @@ impl ExchangeContext {
         println!("persistent data loaded, starting to subscribe");
         let mut stream = self.doc.subscribe().await?;
 
-        let mut entry_hashes: HashMap<Hash, Entry> = HashMap::new();
+        // let mut entry_hashes: HashMap<Hash, Entry> = HashMap::new();
+        let mut crp = ContentReadyProcessor::new();
         println!("listening for changes");
-        while let Some(event) = stream.next().await {
-            let event: Result<LiveEvent> = event;
-            let event: LiveEvent = match event {
-                Ok(e) => { e }
-                Err(_) => { continue }
-            };
-
+        while let Some(Ok(event)) = stream.next().await {
             let handle_result: Result<()> = match event {
-                LiveEvent::InsertLocal { entry } => {
-                    println!("insert local {}", String::from_utf8_lossy(entry.key()));
-                    self.handle_ready_blob(entry).await
-                }
-                LiveEvent::InsertRemote { entry, content_status, .. } => {
-                    println!("insert remote {}", String::from_utf8_lossy(entry.key()));
-                    match content_status {
-                        ContentStatus::Complete => {
-                            println!("remote was complete, lets handle");
-                            self.handle_ready_blob(entry).await
-                        },
-                        _ => {
-                            println!("remote incomplete for {}", entry.content_hash());
-                            entry_hashes.insert(entry.content_hash(), entry);
-                            Ok(())
-                        }
-                    }
-                }
-                LiveEvent::ContentReady { hash } => {
-                    println!("content ready {hash}");
-                    if let Some(entry) = entry_hashes.remove(&hash) {
-                        self.handle_ready_blob(entry).await
-                    } else {
-                        println!("hash ready for something i wasnt tracking... {hash}");
-                        Ok(())
-                    }
-
-                }
+                // LiveEvent::InsertLocal { entry } => {
+                //     println!("insert local {}", String::from_utf8_lossy(entry.key()));
+                //     self.handle_ready_blob(entry).await
+                // }
+                // LiveEvent::InsertRemote { entry, content_status, .. } => {
+                //     println!("insert remote {}", String::from_utf8_lossy(entry.key()));
+                //     match content_status {
+                //         ContentStatus::Complete => {
+                //             println!("remote was complete, lets handle");
+                //             self.handle_ready_blob(entry).await
+                //         },
+                //         _ => {
+                //             println!("remote incomplete for {}", entry.content_hash());
+                //             entry_hashes.insert(entry.content_hash(), entry);
+                //             Ok(())
+                //         }
+                //     }
+                // }
+                // LiveEvent::ContentReady { hash } => {
+                //     println!("content ready {hash}");
+                //     if let Some(entry) = entry_hashes.remove(&hash) {
+                //         self.handle_ready_blob(entry).await
+                //     } else {
+                //         println!("hash ready for something i wasnt tracking... {hash}");
+                //         Ok(())
+                //     }
+                //
+                // }
                 LiveEvent::NeighborUp(pk) => {
                     println!("neighbor up {pk}");
                     let mut write_guard = self.connected.write().await;
-                    (*write_guard).insert(pk);
+                    (*write_guard).insert((*pk.as_bytes()).into());
                     let count = write_guard.len();
                     drop(write_guard);
                     self.broadcast(ContextEvents::LiveConnectionsUpdated(count)).await?;
@@ -232,7 +317,7 @@ impl ExchangeContext {
                 LiveEvent::NeighborDown(pk) => {
                     println!("neighbor down {pk}");
                     let mut write_guard = self.connected.write().await;
-                    (*write_guard).remove(&pk);
+                    (*write_guard).remove(&(*pk.as_bytes()).into());
                     let count = write_guard.len();
                     drop(write_guard);
                     self.broadcast(ContextEvents::LiveConnectionsUpdated(count)).await?;
@@ -240,6 +325,21 @@ impl ExchangeContext {
                 }
                 LiveEvent::SyncFinished(..) => {
                     println!("sync finished");
+                    Ok(())
+                },
+                _ => {
+                    if let Some(entry) = crp.process_event(event)? {
+                        let key = std::str::from_utf8(entry.key())?;
+
+                        if let Some(iden) = self.identification_rw.content_ready(key, &entry).await? {
+                            self.new_participant_joined(iden).await?;
+                        } else if let Some(msg) = self.messages_rw.content_ready(key, &entry).await? {
+                            self.new_message_received(msg).await?
+                        } else {
+                            eprintln!("Downloaded blob but cant handle: {}", key);
+                        }
+                        // self.handle_ready_blob(entry).await?;
+                    }
                     Ok(())
                 }
             };
@@ -251,27 +351,29 @@ impl ExchangeContext {
         Ok(())
     }
 
-    async fn handle_ready_blob(&self, entry: Entry) -> Result<()> {
-        let key = String::from_utf8_lossy(entry.key());
-        if key.eq(IDENTIFICATION_KEY) {
-            println!("we found an identification key!!");
-            let iden: Identification = self.node.blobs.deserialize_read_blob(entry.content_hash()).await?;
-            self.new_participant_joined(iden).await
-        } else if key.starts_with(MESSAGE_KEY_PREFIX) {
-            println!("we got a new message!");
-            let msg: Message = self.node.blobs.deserialize_read_blob(entry.content_hash()).await?;
-            self.new_message_received(msg).await
-        } else {
-            Ok(())
-        }
-
-    }
+    // async fn handle_ready_blob(&self, entry: Entry) -> Result<()> {
+    //     let key = String::from_utf8_lossy(entry.key());
+    //     if key.eq(IDENTIFICATION_KEY) {
+    //         println!("we found an identification key!!");
+    //         let iden: Identification = self.node.deserialize_read_blob(entry.content_hash()).await?;
+    //         self.new_participant_joined(iden).await
+    //     } else if key.starts_with(MESSAGE_KEY_PREFIX) {
+    //         println!("we got a new message!");
+    //         let msg: Message = self.node.deserialize_read_blob(entry.content_hash()).await?;
+    //         self.new_message_received(msg).await
+    //     } else {
+    //         Ok(())
+    //     }
+    //
+    // }
 
     async fn new_participant_joined(&self, iden: Identification) -> Result<()> {
         let pk = iden.public_key().clone();
+        let pname = iden.name.clone();
         let mut parts_write_guard = self.participants.write().await;
         (*parts_write_guard).push(iden);
         drop(parts_write_guard);
+        println!("new participant joined! {}, broadcasting", pname);
         self.broadcast(ContextEvents::Join(pk)).await?;
         Ok(())
     }
@@ -297,22 +399,15 @@ impl ExchangeContext {
 
     async fn initial_data_load(&self) -> Result<()> {
         // load participants
+        let mut participants = self.identification_rw.get_all().await?;
         let mut parts_write_guard = self.participants.write().await;
-        let mut saved_participants = self.doc.get_many(Query::key_exact(IDENTIFICATION_KEY)).await?;
-        while let Some(Ok(entry)) = saved_participants.next().await {
-            let entry: Entry = entry;
-            let iden: Identification = self.node.blobs.deserialize_read_blob(entry.content_hash()).await?;
-            (*parts_write_guard).push(iden);
-        }
+        (*parts_write_guard).append(&mut participants);
         drop(parts_write_guard);
 
+        // messages
         let mut msgs_write_guard = self.messages.write().await;
-        let mut saved_msgs = self.doc.get_many(Query::key_prefix(MESSAGE_KEY_PREFIX)).await?;
-        while let Some(Ok(entry)) = saved_msgs.next().await {
-            let entry: Entry = entry;
-            let msg: Message = self.node.blobs.deserialize_read_blob(entry.content_hash()).await?;
-            (*msgs_write_guard).push(msg);
-        };
+        let mut saved_msgs = self.messages_rw.get_all().await?;
+        (*msgs_write_guard).append(&mut saved_msgs);
         (*msgs_write_guard).sort_by_key(|m| m.date);
         drop(msgs_write_guard);
 
@@ -364,6 +459,7 @@ impl Service {
     pub fn new(node: Node, settings: SettingsService, identity: IdentityService) -> Service {
         let (tx, _rx): (Sender<Events>, Receiver<Events>) = broadcast::channel(16);
 
+
         let inner = ServiceInner {
             node,
             settings,
@@ -379,7 +475,7 @@ impl Service {
         if self.broadcast.receiver_count() > 0 {
             self.broadcast.send(event)
         } else {
-            println!("not sending cuz no ones listening");
+            println!("ExchangeService tried to broadcast but no ones listening {:?}", event);
             Ok(0)
         }
     }
@@ -401,7 +497,7 @@ impl Service {
         println!("created doc for exchange {}, {:?}", doc.id(), doc.status().await?);
 
         let ex = ExchangeContext::new(ex_id, doc, self.node.clone());
-        ex.start();
+        ex.start().await?;
 
         if register {
             // save namespace id to list of exchange namespace ids
@@ -423,7 +519,7 @@ impl Service {
         save_on_doc_as_key(&self.node, &doc, myself.public_key(), IDENTIFICATION_KEY, &myself).await?;
 
         let ex = ExchangeContext::new(ex_id, doc, self.node.clone());
-        ex.start();
+        ex.start().await?;
 
         if register {
             self.save_exchange_id(ex_id.clone()).await?;
@@ -484,7 +580,7 @@ impl Service {
             .ok_or_else(|| anyhow!("No exchange document to load"))?;
 
         let ex_ctx = ExchangeContext::new(exchange_id, doc, self.node.clone());
-        ex_ctx.start();
+        ex_ctx.start().await?;
 
         Ok(ex_ctx)
     }
@@ -501,7 +597,7 @@ impl Service {
                         self_clone.broadcast(ExchangeListDidUpdate).await.expect("gdamnitshit");
                     }
                     ContextEvents::MessageReceived(_) => {}
-                    ContextEvents::LiveConnectionsUpdated(count) => {
+                    ContextEvents::LiveConnectionsUpdated(..) => {
                         // if any little guys change, update whole exchange list
                         self_clone.broadcast(ExchangeListDidUpdate).await.expect("gdamnitshit");
                     }

@@ -1,20 +1,13 @@
-use std::fmt::Display;
 use std::sync::Arc;
 
 use anyhow::Result;
-use fallible_iterator::FallibleIterator;
-use futures_util::StreamExt;
-use tokio::pin;
 use tokio::runtime::Handle;
-use tokio::sync::mpsc::Sender;
 
-use crate::data::WideId;
 use crate::dispatch::{AsyncMessageDispatch, EventSender, EventWrapper};
 use crate::dispatch::EventWrapper::Event;
 use crate::dispatch::exchange::ExchangeEvents::NameChanged;
-use crate::exchange::{ContextEvents, Events, ExchangeContext, Message, Service as ExchangeService};
-use crate::identity::{Identification, ParticipantList, Service as IdentityService};
-use crate::settings::Service as SettingsService;
+use crate::exchange::{ContextEvents, ExchangeContext, Message};
+use crate::identity::{ParticipantList, Service as IdentityService};
 
 #[derive(uniffi::Object)]
 pub struct ExchangeDispatcher {
@@ -91,7 +84,7 @@ async fn reload_messages(ctx: &Arc<Context>, tx: &EventSender<ExchangeEvents>) -
 //     Ok(())
 // }
 
-async fn send_message(text: String, ctx: Arc<Context>, tx: EventSender<ExchangeEvents>) -> Result<()> {
+async fn send_message(text: String, ctx: Arc<Context>, _tx: EventSender<ExchangeEvents>) -> Result<()> {
     let myself = ctx.identity.assumed_identity().await.unwrap();
     let msg = Message::new(myself.public_key(), text.as_str());
     ctx.ectx.send_message(&msg).await?;
