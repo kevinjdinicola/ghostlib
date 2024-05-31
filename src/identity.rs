@@ -2,10 +2,14 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use anyhow::Result;
+use iroh::blobs::util::SetTagOption;
+use iroh::client::blobs::WrapOption;
+use iroh::client::docs::Entry;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{OnceCell, RwLock};
 
-use crate::data::{Doc, load_from_doc_at_key, Node, PublicKey, save_on_doc_as_key};
+use crate::data::{BlobHash, Doc, load_from_doc_at_key, Node, PublicKey, save_on_doc_as_key};
+use crate::live_doc::File;
 use crate::settings::Service as SettingsService;
 
 const IDENTIFICATION_PREFIX: &str = "identity/identification/";
@@ -110,6 +114,17 @@ impl Service {
     pub async fn get_identification(&self, pk: &PublicKey) -> Result<Identification> {
         let key = format!("{IDENTIFICATION_PREFIX}/{}", &pk);
         load_from_doc_at_key(&self.node, self.doc().await, None, &key).await
+    }
+    pub async fn set_pic(&self, owner: &PublicKey, data: Vec<u8>) -> Result<BlobHash> {
+        let add_res = self.node.blobs.add_bytes(data).await?;
+        self.doc().await.set_hash(owner.into(), "id_pic", add_res.hash, add_res.size).await?;
+
+        Ok(add_res.hash.into())
+    }
+
+    pub async fn get_pic(&self, owner: &PublicKey) -> Result<Option<Entry>> {
+        let pic = self.doc().await.get_exact(owner.into(), "id_pic", false).await?;
+        Ok(pic)
     }
 
     pub async fn create_identification(&self, name: &str) -> Result<Identification>

@@ -1,3 +1,4 @@
+use std::fmt::Debug;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -8,11 +9,12 @@ use anyhow::Result;
 use tokio::runtime::{Handle, Runtime};
 use tokio::sync::RwLock;
 
-use crate::data::{ExchangeId, Node};
+use crate::data::{BlobHash, ExchangeId, Node};
+use crate::dispatch::blob::BlobDataDispatcher;
 use crate::dispatch::establish_connection::EstablishConnectionDispatcher;
 use crate::dispatch::exchange::ExchangeDispatcher;
 use crate::dispatch::global::GlobalAppDispatcher;
-use crate::exchange::Service as ExchangeService;
+use crate::exchange::ExchangeService;
 use crate::identity::Service as IdentityService;
 use crate::settings::Service as SettingsService;
 
@@ -23,7 +25,8 @@ pub mod settings;
 pub mod data;
 pub mod identity;
 pub mod exchange;
-mod live_doc;
+pub mod live_doc;
+mod establish;
 
 //
 // some kind of root context to host the initialized rust app and
@@ -45,6 +48,7 @@ pub struct AppHost {
     pub settings: SettingsService,
     pub identity: IdentityService,
     pub exchange: ExchangeService,
+    pub blob_data: Arc<BlobDataDispatcher>,
     global_dispatch: Arc<GlobalAppDispatcher>,
     reset_flag: AtomicBool,
     config: AppConfig,
@@ -79,13 +83,15 @@ impl AppHost {
         let settings = SettingsService::new(node.clone(), &config.data_path.as_str());
         let identity = IdentityService::new(node.clone(), settings.clone());
         let exchange = ExchangeService::new(node.clone(), settings.clone(), identity.clone());
+        let bdd = BlobDataDispatcher::new(node.clone());
 
         println!("Created ghostlib app host");
 
         let gd = GlobalAppDispatcher::new(dispatch::global::Context {
             settings: settings.clone(),
             identity: identity.clone(),
-            exchange: exchange.clone()
+            exchange: exchange.clone(),
+            node: node.clone()
         });
 
         AppHost {
@@ -96,14 +102,15 @@ impl AppHost {
             identity,
             exchange,
             reset_flag: AtomicBool::new(false),
-            config
+            config,
+            blob_data: Arc::new(bdd)
         }
     }
 
     pub fn global_dispatch(&self) -> Arc<GlobalAppDispatcher> {
         self.global_dispatch.clone()
     }
-
+    pub fn blob_dispatch(&self) -> Arc<BlobDataDispatcher> { self.blob_data.clone()  }
     pub fn create_establish_connection_dispatch(&self) -> Arc<EstablishConnectionDispatcher> {
         let _guard = self.handle().enter();
         let dispatcher = EstablishConnectionDispatcher::new(dispatch::establish_connection::Context  {
@@ -114,6 +121,15 @@ impl AppHost {
         });
         Arc::new(dispatcher)
     }
+
+    // pub async fn stream_blob(&self, blob_hash: BlobHash) {
+    //     let locked_node = self.node.read().await;
+    //     let node = {
+    //         locked_node.clone().unwrap()
+    //     };
+    //     let reader = node.blobs.read(blob_hash.as_bytes().into()).await?;
+    //     reader.read
+    // }
 
     pub fn create_exchange_context_dispatch(&self, exchange_id: ExchangeId) -> Arc<ExchangeDispatcher> {
         let ectx = self.handle().block_on(async {
@@ -165,11 +181,9 @@ impl AppHost {
 mod tests {
     use std::fs;
     use std::future::Future;
-    use std::pin::Pin;
     use std::time::Duration;
 
     use anyhow::anyhow;
-    use futures_util::TryFutureExt;
     use iroh::base::node_addr::AddrInfoOptions;
     use iroh::base::ticket::Ticket;
     use iroh::client::docs::ShareMode::Write;
@@ -178,7 +192,8 @@ mod tests {
     use tokio::sync::broadcast::Receiver;
 
     use crate::data::{BlobsSerializer, ExchangeId, PublicKey};
-    use crate::exchange::{ContextEvents, ExchangeContext, Message};
+    use crate::exchange::context::{ContextEvents, ExchangeContext};
+    use crate::exchange::Message;
     use crate::identity::Identification;
 
     // Note this useful idiom: importing names from outer (for mod tests) scope.
@@ -360,16 +375,8 @@ mod tests {
     #[test]
     fn joiner() {
         wipe_test_dir(None);
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        let abort_tx = tx.clone();
         // first
         let ah = AppHost::new(AppConfig { data_path: TEST_DIR.into() } );
-
-        // setup aborter
-        ah.handle().spawn(async move {
-            tokio::time::sleep(Duration::from_millis(10000)).await;
-            abort_tx.send("timeout".into()).await
-        });
 
         let ticket = ah.handle().block_on(async {
             let node: iroh::node::MemNode = iroh::node::Node::memory().spawn().await.unwrap();
@@ -387,13 +394,6 @@ mod tests {
             Ok::<String, anyhow::Error>(ticket)
         }).unwrap();
 
-        let jh = ah.handle().spawn(async move {
-            match rx.recv().await {
-                Some(str) => { str }
-                None => { String::from("err") }
-            }
-        });
-
         let res = ah.handle().block_on(async {
             ah.identity.create_identification("kevin").await?;
             let ex = ah.exchange.join_exchange(&ticket, true).await?;
@@ -410,31 +410,8 @@ mod tests {
                 }
             }).await
 
-            //
-            // let mut listener = ex.subscribe();
-            // let ex_clone = ex.clone();
-            // ah.handle().spawn(async move {
-            //     let ex = ex_clone;
-            //     match listener.recv().await {
-            //         Ok(ExchangeEvents::Join(pk)) => {
-            //             let found = ex.participants().await.into_iter().find(|p| {
-            //                 p.public_key() == &pk
-            //             });
-            //             match found {
-            //                 None => { }
-            //                 Some(i) => {
-            //                     tx.send(String::from(i.name())).await.unwrap();
-            //                 }
-            //             };
-            //         },
-            //         Ok(_) => { },
-            //         Err(..) => { }
-            //     }
-            // });
-            // Ok::<(), anyhow::Error>(())
         });
 
-        // let str = ah.handle().block_on(jh).unwrap();
         ah.shutdown();
         assert_eq!(res.unwrap().name, "hurshal");
         println!("Success!");
@@ -520,6 +497,7 @@ mod tests {
                            tx.send(m.text).await.unwrap();
                        }
                        ContextEvents::LiveConnectionsUpdated(_) => {}
+                       ContextEvents::FileUpdated(_) => {}
                    }
                }
             });

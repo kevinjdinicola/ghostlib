@@ -5,9 +5,11 @@ use tokio::runtime::Handle;
 
 use crate::dispatch::{AsyncMessageDispatch, EventSender, EventWrapper};
 use crate::dispatch::EventWrapper::Event;
-use crate::dispatch::exchange::ExchangeEvents::NameChanged;
-use crate::exchange::{ContextEvents, ExchangeContext, Message};
+use crate::dispatch::exchange::ExchangeEvents::{NameChanged, OthersPicUpdated};
+use crate::exchange::context::{ContextEvents, ExchangeContext};
+use crate::exchange::{ID_PIC, Message};
 use crate::identity::{ParticipantList, Service as IdentityService};
+use crate::live_doc::File;
 
 #[derive(uniffi::Object)]
 pub struct ExchangeDispatcher {
@@ -23,6 +25,7 @@ pub struct Context {
 #[derive(uniffi::Enum)]
 pub enum ExchangeEvents {
     NameChanged(String),
+    OthersPicUpdated(File),
     MessagesReloaded{ messages: Vec<DisplayMessage>},
     MessageReceived { message: DisplayMessage },
     LiveConnectionsUpdated { count: u32 }
@@ -99,9 +102,18 @@ async fn update_name(ctx: &Arc<Context>, tx: &EventSender<ExchangeEvents>) -> Re
     Ok(())
 }
 
+async fn file_updated(file: File, ctx: &Arc<Context>, tx: &EventSender<ExchangeEvents>) -> Result<()> {
+    // i only really care about id pics of the other person in this particular context
+    let myself = ctx.identity.assumed_identity().await.unwrap();
+    if file.owner != myself.public_key && file.name.eq(ID_PIC) {
+        tx.send(Event(OthersPicUpdated(file))).await?;
+    }
+    Ok(())
+}
+
 fn watch_exchange_context(ctx: Arc<Context>, tx: EventSender<ExchangeEvents>) {
     Handle::current().spawn(async move {
-        let mut  subby = ctx.ectx.subscribe();
+        let mut subby = ctx.ectx.subscribe();
         while let Ok(e) = subby.recv().await {
             match e {
                 ContextEvents::Loaded => {}
@@ -111,6 +123,9 @@ fn watch_exchange_context(ctx: Arc<Context>, tx: EventSender<ExchangeEvents>) {
                 }
                 ContextEvents::LiveConnectionsUpdated(count) => {
                     tx.send(Event(ExchangeEvents::LiveConnectionsUpdated { count: count as u32 })).await.unwrap()
+                }
+                ContextEvents::FileUpdated(file) => {
+                    file_updated(file, &ctx, &tx).await.unwrap();
                 }
             }
         }

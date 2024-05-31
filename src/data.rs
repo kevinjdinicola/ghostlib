@@ -49,6 +49,7 @@ impl WideId {
     }
 }
 
+
 impl From<[u8; 32]> for WideId {
     fn from(value: [u8; 32]) ->  Self {
         unsafe {
@@ -101,6 +102,12 @@ impl From<AuthorId> for WideId {
     }
 }
 
+impl From<Hash> for WideId {
+    fn from(value: Hash) -> Self {
+        (*value.as_bytes()).into()
+    }
+}
+
 impl From<NamespaceId> for WideId {
     fn from(value: NamespaceId) -> Self {
         value.to_bytes().into()
@@ -117,6 +124,8 @@ impl From<WideId> for NamespaceId {
 
 pub type PublicKey = WideId;
 pub type ExchangeId = WideId;
+
+pub type BlobHash = WideId;
 
 
 pub async fn load_from_doc_at_key<T: for<'a> Deserialize<'a>>(node: &Node, doc: &Doc, pk: Option<&PublicKey>, key: &str) -> anyhow::Result<T> {

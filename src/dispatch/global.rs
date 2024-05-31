@@ -1,20 +1,20 @@
 use std::sync::Arc;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::Sender;
-use crate::data::{ExchangeId, WideId};
-
-
+use crate::data::{BlobHash, ExchangeId, Node, WideId};
 use crate::dispatch::{AsyncMessageDispatch, EventSender, EventWrapper};
+use crate::dispatch::blob::BlobDataDispatcher;
 use crate::dispatch::EventWrapper::Event;
-use crate::dispatch::global::GlobalEvents::{ExchangeCreated, ExchangeListChanged, IdentityNeeded, IdentitySelected};
-use crate::identity::{Identification, Service as IdentityService};
+use crate::dispatch::global::GlobalEvents::{ExchangeCreated, ExchangeListChanged, IdentityNeeded, IdentityPicUpdate, IdentitySelected};
+use crate::exchange::{ExchangeService, ExchangeServiceEvent, ID_PIC};
+use crate::identity::{Identification, ParticipantList, Service as IdentityService};
 use crate::settings::Service as SettingsService;
-use crate::exchange::{Events, Service as ExchangeService};
 
 pub struct Context {
     pub settings: SettingsService,
     pub identity: IdentityService,
     pub exchange: ExchangeService,
+    pub node: Node,
 
 }
 
@@ -29,7 +29,8 @@ pub enum GlobalEvents {
     IdentityNeeded,
     IdentitySelected(Identification),
     ExchangeListChanged(Vec<ExchangeListItem>),
-    ExchangeCreated(WideId)
+    ExchangeCreated(WideId),
+    IdentityPicUpdate(BlobHash)
 }
 
 #[derive(Debug)]
@@ -39,7 +40,8 @@ pub enum GlobalActions {
     CreateIdentity(String),
     CreateExchange,
     DeleteExchange(ExchangeId),
-    WakeFromSleep
+    WakeFromSleep,
+    SetIdentityPic(Vec<u8>)
 }
 
 #[uniffi::export(with_foreign)]
@@ -52,6 +54,7 @@ pub trait GlobalDispatchResponder: Send + Sync{
 pub struct ExchangeListItem {
     id: WideId,
     label: String,
+    pic: Option<BlobHash>,
     connections: u32
 }
 
@@ -95,6 +98,10 @@ async fn start(ctx: Arc<Context>, tx: &Sender<EventWrapper<GlobalEvents>>) -> an
         Some(iden) => {
             ctx.exchange.reload_contexts(None, None).await?;
             // exchange_list_changed(ctx, tx).await?;
+            if let Some(iden_pic) = ctx.identity.get_pic(iden.public_key()).await? {
+                tx.send(Event(IdentityPicUpdate(iden_pic.content_hash().into()))).await?;
+            }
+
             tx.send(Event(IdentitySelected(iden))).await?;
         }
     }
@@ -109,19 +116,18 @@ async fn exchange_list_changed(ctx: &Arc<Context>, tx: &Sender<EventWrapper<Glob
     println!("updating exchanges in ui, found {} contexts", ctxs.len());
 
     for ex in ctxs {
-        let parts = ex.participants().await;
-        let connection_count = ex.live_connection_count().await?;
-        let idens = parts.iter().as_slice();
-        let label: String = if idens[0].public_key != me.public_key {
-            idens[0].name.as_str().into()
-        } else if idens.len()  == 2 {
-            idens[1].name.as_str().into()
+        let maybe_other = ex.participants().await.get_other(me.public_key());
+
+        let (label, pic_hash): (String, Option<BlobHash>) = if let Some(other) = maybe_other {
+            let pic = ex.get_file(other.public_key(), ID_PIC).await?;
+            (other.name, pic)
         } else {
             let id_prefix = ex.id().to_string();
             let id_prefix = &id_prefix.as_str()[..6];
-            format!("loading... ({id_prefix}")
+            (format!("loading... ({id_prefix}"), None)
         };
-        disps.push(ExchangeListItem { id: ex.id(), label, connections: connection_count as u32 });
+        let cnx = ex.live_connection_count().await?;
+        disps.push(ExchangeListItem { id: ex.id(), label, pic: pic_hash, connections: cnx as u32 });
     }
 
     tx.send(Event(ExchangeListChanged(disps))).await?;
@@ -146,7 +152,7 @@ async fn delete_exchange(ex_id: ExchangeId, ctx: Arc<Context>, _tx: &Sender<Even
         let mut subby = ctx.exchange.subscribe();
         while let Ok(e) = subby.recv().await {
             match e {
-                Events::ExchangeListDidUpdate => {
+                ExchangeServiceEvent::ListDidUpdate => {
                     exchange_list_changed(&ctx, &tx).await.expect("couldnt send");
                 }
             }
@@ -174,6 +180,16 @@ async fn action(ctx: Arc<Context>, action: GlobalActions, tx: EventSender<Global
         GlobalActions::WakeFromSleep => {
             println!("app woke from sleep");
             ctx.exchange.sync_all().await?;
+        }
+        GlobalActions::SetIdentityPic(path) => {
+            let myself = ctx.identity.assumed_identity().await.unwrap();
+            let hash = ctx.identity.set_pic(myself.public_key(), path).await?;
+            println!("identity pic set! hash {}", hash);
+
+            // lol does this work
+            ctx.exchange.reload_pic_for_all().await?;
+
+            tx.send(Event(IdentityPicUpdate(hash))).await?;
         }
     };
     Ok(())

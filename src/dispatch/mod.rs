@@ -12,6 +12,7 @@ use tokio::sync::Mutex;
 pub mod global;
 pub mod establish_connection;
 pub mod exchange;
+pub mod blob;
 
 // pub mod exchange;
 

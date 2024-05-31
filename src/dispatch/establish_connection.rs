@@ -1,12 +1,14 @@
 use std::sync::Arc;
 use tokio::runtime::Handle;
 use tokio::sync::RwLock;
+use crate::data::BlobHash;
 use crate::dispatch::{AsyncMessageDispatch, EventSender, EventWrapper};
-use crate::dispatch::establish_connection::EstablishConnectionEvents::{AttemptingJoin, ConnectionConfirmed, ConnectionEstablished, ConnectionRejected, JoinTicketGenerated};
+use crate::dispatch::establish_connection::EstablishConnectionEvents::{AttemptingJoin, ConnectionConfirmed, ConnectionEstablished, ConnectionRejected, JoinTicketGenerated, PicLoaded};
 use crate::dispatch::EventWrapper::Event;
+use crate::exchange::context::{ContextEvents, ExchangeContext};
 use crate::identity::{Identification, ParticipantList, Service as IdentityService};
 use crate::settings::Service as SettingsService;
-use crate::exchange::{ContextEvents, ExchangeContext, Service as ExchangeService};
+use crate::exchange::{ExchangeService, ID_PIC};
 #[derive(uniffi::Object)]
 pub struct EstablishConnectionDispatcher {
     dispatch: AsyncMessageDispatch<EstablishConnectionEvents, EstablishConnectionActions, Arc<Context>>,
@@ -25,6 +27,7 @@ pub enum EstablishConnectionEvents {
     JoinTicketGenerated(String),
     AttemptingJoin,
     ConnectionEstablished(Identification),
+    PicLoaded(BlobHash),
     ConnectionConfirmed,
     ConnectionRejected
 }
@@ -48,15 +51,29 @@ fn wait_for_other_participants(exctx: ExchangeContext, ctx: Arc<Context>, tx: Ev
     Handle::current().spawn(async move {
         let myself = ctx.identity.assumed_identity().await.unwrap();
         let mut subby = exctx.subscribe();
+        let mut shittycounter = 0;
         while let Ok(e) = subby.recv().await {
             match e {
                 ContextEvents::Join(i) => {
                     if i != myself.public_key {
                         let other = exctx.participants().await.get_other(myself.public_key()).unwrap();
                         tx.send(Event(ConnectionEstablished(other))).await.expect("couldnt send msg!");
-                        break;
+                        shittycounter+=1;
+                        if shittycounter == 2 {
+                            break;
+                        }
                     }
                 },
+                ContextEvents::FileUpdated(f) => {
+                    if f.name.eq(ID_PIC) {
+                        println!("got the id pic in rust!");
+                        tx.send(Event(PicLoaded(f.blob))).await.expect("arg")
+                    }
+                    shittycounter+=1;
+                    if shittycounter == 2 {
+                        break;
+                    }
+                }
                 _ => { }
             }
         }
