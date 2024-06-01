@@ -7,6 +7,7 @@ use iroh::docs::NamespaceId;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::OnceCell;
+use tracing::info;
 
 use crate::data::{Doc, Node};
 
@@ -54,13 +55,13 @@ impl Service {
                 let mut contents: [u8; 32] = [0; 32];
                 if let Ok(_) = file.read(&mut contents).await {
                     let read_namespace = NamespaceId::from(&contents);
-                    println!("Existing settings namespace found, opening: {}", read_namespace);
+                    info!("Existing settings namespace found, opening: {}", read_namespace);
                     inner.node.docs.open(read_namespace).await.unwrap_or(None)
                 } else {
                     None
                 }
             } else {
-                println!("Failed to open existing root settings path, creating new namespace");
+                info!("Failed to open existing root settings path, creating new namespace");
                 let doc = inner.node.docs.create().await.expect("Failed to create new doc for settings");
                 let mut file = File::create(&inner.path).await.expect("couldnt open");
                 let created_ns = doc.id();

@@ -9,23 +9,19 @@ use anyhow::Result;
 use futures_util::StreamExt;
 use iroh::base::node_addr::AddrInfoOptions;
 use iroh::base::ticket::Ticket;
-use iroh::blobs::util::SetTagOption;
-use iroh::client::blobs::WrapOption;
 use iroh::client::docs::{Entry, LiveEvent};
 use iroh::client::docs::ShareMode::Write;
-use iroh::docs::ContentStatus;
 use iroh::net::NodeAddr;
 use tokio::sync::{broadcast, RwLock};
 use tokio::sync::broadcast::{Receiver, Sender};
 use tokio::sync::broadcast::error::SendError;
-use tracing_subscriber::fmt::format;
+use tracing::{debug, error, info, warn};
 
 use crate::data::{BlobHash, Doc, ExchangeId, Node, PublicKey, save_on_doc_as_key};
-use crate::dispatch::global::Context;
-use crate::exchange::{IDENTIFICATION_KEY, FILE_KEY_PREFIX, Message, MESSAGE_KEY_PREFIX, ID_PIC};
-use crate::exchange::context::ContextEvents::Loaded;
+use crate::exchange::{FILE_KEY_PREFIX, IDENTIFICATION_KEY, Message, MESSAGE_KEY_PREFIX};
+use crate::exchange::context::ContextEvents::{Loaded, SyncFinished};
 use crate::identity::Identification;
-use crate::live_doc::{ContentReadyProcessor, IdentificationReadWriter, MessagesReadWriter, File, FileReadWriter};
+use crate::live_doc::{ContentReadyProcessor, File, FileReadWriter, IdentificationReadWriter, MessagesReadWriter};
 
 #[derive(Clone)]
 pub struct ExchangeContext(Arc<ExchangeContextInner>);
@@ -51,6 +47,7 @@ pub enum ContextEvents {
     MessageReceived(Message),
     LiveConnectionsUpdated(usize),
     FileUpdated(File),
+    SyncFinished,
 }
 
 fn make_message_key(message: &Message) -> String {
@@ -100,10 +97,10 @@ impl ExchangeContext {
         tokio::spawn(async move {
             match worker.worker_loop().await {
                 Ok(_) => {
-                    println!("worker ended successfully")
+                    debug!("worker ended successfully")
                 }
                 Err(err) => {
-                    eprintln!("worker ended in error: {}", err)
+                    error!("worker ended in error: {}", err)
                 }
             }
         });
@@ -130,6 +127,7 @@ impl ExchangeContext {
     }
     pub async fn generate_join_ticket(&self) -> Result<String> {
         let ticket = self.doc.share(Write, AddrInfoOptions::Addresses).await?;
+        // let bytes = Ticket::to_bytes(&ticket);
         Ok(Ticket::serialize(&ticket))
     }
 
@@ -138,7 +136,7 @@ impl ExchangeContext {
     }
 
     pub async fn shutdown(&self) -> Result<()> {
-        println!("shutting down context {}", self.id);
+        info!("shutting down context {}", self.id);
         self.doc.leave().await?;
         self.doc.close().await
     }
@@ -146,10 +144,10 @@ impl ExchangeContext {
     async fn broadcast(&self, event: ContextEvents) -> Result<usize, SendError<ContextEvents>> {
         // todo will this ever race condition? should i just catch errors?
         if self.broadcast.receiver_count() > 0 {
-            println!("broadcasting {:?}", event);
+            debug!("broadcasting {:?}", event);
             self.broadcast.send(event)
         } else {
-            println!("Tried to broadcast, but no one is listening {:?}", event);
+            debug!("Tried to broadcast, but no one is listening {:?}", event);
             Ok(0)
         }
     }
@@ -165,7 +163,7 @@ impl ExchangeContext {
             let peers: Vec<NodeAddr>= peers.iter().map(|peer_id_bytes| {
                 NodeAddr::new(iroh::net::key::PublicKey::from_bytes(peer_id_bytes).unwrap())
             }).collect();
-            println!("starting sync with {:?}", peers);
+            debug!("starting sync with {:?}", peers);
             self.doc.start_sync(peers).await?;
         }
 
@@ -173,15 +171,14 @@ impl ExchangeContext {
     }
 
     async fn worker_loop(self) -> Result<()> {
-        println!("staring worker loop for {}", self.id);
+        info!("staring worker loop for {}", self.id);
         self.initial_data_load().await?;
         self.broadcast(Loaded).await?;
-        println!("persistent data loaded, starting to subscribe");
+        debug!("persistent data loaded, starting to subscribe");
         let mut stream = self.doc.subscribe().await?;
 
         // let mut entry_hashes: HashMap<Hash, Entry> = HashMap::new();
         let mut crp = ContentReadyProcessor::new();
-        println!("listening for changes");
 
         while let Some(Ok(event)) = stream.next().await {
             let handle_result: Result<()> = match event {
@@ -193,8 +190,9 @@ impl ExchangeContext {
                     self.neighbor_changed((*pk.as_bytes()).into(), false).await?;
                     Ok(())
                 }
-                LiveEvent::SyncFinished(..) => {
-                    println!("sync finished");
+                LiveEvent::SyncFinished(e) => {
+                    debug!("sync finished with {}", e.peer);
+                    self.broadcast(SyncFinished).await?;
                     Ok(())
                 },
                 _ => {
@@ -208,7 +206,7 @@ impl ExchangeContext {
                         } else if let Some(file) = self.file_rw.content_ready(key, &entry).await? {
                             self.file_updated(file).await?;
                         } else {
-                            eprintln!("Downloaded blob but cant handle: {}", key);
+                            warn!("Downloaded blob but cant handle: {}", key);
                         }
                         // self.handle_ready_blob(entry).await?;
                     }
@@ -216,15 +214,15 @@ impl ExchangeContext {
                 }
             };
             if let Err(e) = handle_result {
-                eprintln!("whats going on in my subscriber!! {}", e);
+                error!("ExchangeContext worker got error {}", e);
             }
         };
-        println!("Worker loop ended for {}", self.id);
+        info!("Worker loop ended for {}", self.id);
         Ok(())
     }
 
     async fn neighbor_changed(&self, pk: PublicKey, joined: bool) -> Result<()> {
-        println!("neighbor down {pk}");
+        debug!("neighbor down {pk}");
         let mut write_guard = self.connected.write().await;
         if joined {
             (*write_guard).insert(pk);
@@ -242,7 +240,7 @@ impl ExchangeContext {
         let mut parts_write_guard = self.participants.write().await;
         (*parts_write_guard).push(iden);
         drop(parts_write_guard);
-        println!("new participant joined! {}, broadcasting", pname);
+        debug!("new participant joined! {}, broadcasting", pname);
         self.broadcast(ContextEvents::Join(pk)).await?;
         Ok(())
     }

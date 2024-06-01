@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use tokio::runtime::Handle;
+use tracing::debug;
 
 use crate::dispatch::{AsyncMessageDispatch, EventSender, EventWrapper};
 use crate::dispatch::EventWrapper::Event;
@@ -48,7 +49,7 @@ pub struct DisplayMessage {
 
 impl Drop for ExchangeDispatcher {
     fn drop(&mut self) {
-        println!("Exchange controller dropped")
+        debug!("Exchange controller dropped")
     }
 }
 
@@ -127,6 +128,7 @@ fn watch_exchange_context(ctx: Arc<Context>, tx: EventSender<ExchangeEvents>) {
                 ContextEvents::FileUpdated(file) => {
                     file_updated(file, &ctx, &tx).await.unwrap();
                 }
+                ContextEvents::SyncFinished => {}
             }
         }
     });
@@ -154,7 +156,7 @@ async fn action(ctx: Arc<Context>, action: ExchangeActions, tx: EventSender<Exch
 #[uniffi::export]
 impl ExchangeDispatcher {
     pub fn emit_action(&self, action: ExchangeActions) {
-        println!("emitting action {:?}", action);
+        debug!("emitting action {:?}", action);
         self.message_adapter.emit_action(action);
     }
 
@@ -164,7 +166,7 @@ impl ExchangeDispatcher {
 
     pub fn register_responder(&self, responder: Arc<dyn ExchangeDispatchResponder>) {
         self.message_adapter.register_responder(move |e| {
-            println!("responding with event {:?}", e);
+            debug!("responding with event {:?}", e);
             responder.event(e);
         });
     }
@@ -175,7 +177,7 @@ impl ExchangeDispatcher {
     pub fn new(ctx: Context) -> ExchangeDispatcher {
         let message_adapter = AsyncMessageDispatch::new(Arc::new(ctx));
         message_adapter.register_action_handler(action);
-        println!("Created an exchange controller");
+        debug!("Created an exchange controller");
         ExchangeDispatcher {
             message_adapter,
         }

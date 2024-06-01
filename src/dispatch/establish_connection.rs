@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use tokio::runtime::Handle;
 use tokio::sync::RwLock;
+use tracing::{debug, info};
 use crate::data::BlobHash;
 use crate::dispatch::{AsyncMessageDispatch, EventSender, EventWrapper};
 use crate::dispatch::establish_connection::EstablishConnectionEvents::{AttemptingJoin, ConnectionConfirmed, ConnectionEstablished, ConnectionRejected, JoinTicketGenerated, PicLoaded};
@@ -10,7 +11,7 @@ use crate::identity::{Identification, ParticipantList, Service as IdentityServic
 use crate::settings::Service as SettingsService;
 use crate::exchange::{ExchangeService, ID_PIC};
 #[derive(uniffi::Object)]
-pub struct EstablishConnectionDispatcher {
+struct EstablishConnectionDispatcher {
     dispatch: AsyncMessageDispatch<EstablishConnectionEvents, EstablishConnectionActions, Arc<Context>>,
 }
 pub struct Context {
@@ -66,7 +67,7 @@ fn wait_for_other_participants(exctx: ExchangeContext, ctx: Arc<Context>, tx: Ev
                 },
                 ContextEvents::FileUpdated(f) => {
                     if f.name.eq(ID_PIC) {
-                        println!("got the id pic in rust!");
+                        debug!("got the id pic in rust!");
                         tx.send(Event(PicLoaded(f.blob))).await.expect("arg")
                     }
                     shittycounter+=1;
@@ -83,7 +84,7 @@ fn wait_for_other_participants(exctx: ExchangeContext, ctx: Arc<Context>, tx: Ev
 async fn action(ctx: Arc<Context>, action: EstablishConnectionActions, tx: EventSender<EstablishConnectionEvents>) -> anyhow::Result<()> {
     match action {
         EstablishConnectionActions::Start => {
-            println!("started establish connection context")
+            info!("started establish connection context")
         }
         EstablishConnectionActions::GenerateJoinTicket => {
 
@@ -124,7 +125,7 @@ async fn action(ctx: Arc<Context>, action: EstablishConnectionActions, tx: Event
             };
         }
         EstablishConnectionActions::AcceptConnection => {
-            println!("some kind of accept connection logic? it's already added into the exchange service");
+            info!("some kind of accept connection logic? it's already added into the exchange service");
             let mut write_guard = ctx.ex_ctx.write().await;
             let exctx = (*write_guard).take().unwrap();
             ctx.exchange.add_context(exctx).await?;

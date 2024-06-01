@@ -1,17 +1,19 @@
-use std::fmt::Debug;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::Relaxed;
 
-use anyhow::Result;
+
 use tokio::runtime::{Handle, Runtime};
 use tokio::sync::RwLock;
+use tracing::{debug, info};
+use tracing_subscriber::EnvFilter;
 
-use crate::data::{BlobHash, ExchangeId, Node};
+
+use crate::data::{ExchangeId, Node};
 use crate::dispatch::blob::BlobDataDispatcher;
-use crate::dispatch::establish_connection::EstablishConnectionDispatcher;
+use crate::dispatch::establish::EstablishConnectionDispatcher;
 use crate::dispatch::exchange::ExchangeDispatcher;
 use crate::dispatch::global::GlobalAppDispatcher;
 use crate::exchange::ExchangeService;
@@ -26,7 +28,6 @@ pub mod data;
 pub mod identity;
 pub mod exchange;
 pub mod live_doc;
-mod establish;
 
 //
 // some kind of root context to host the initialized rust app and
@@ -35,7 +36,17 @@ mod establish;
 
 #[derive(uniffi::Record)]
 pub struct AppConfig {
-    pub data_path: String
+    pub data_path: String,
+    pub log_directive: Option<String>
+}
+
+impl AppConfig {
+    pub fn new(data_path: String) -> AppConfig {
+        AppConfig {
+            data_path,
+            log_directive: None
+        }
+    }
 }
 
 
@@ -65,13 +76,29 @@ impl AppHost {
 
 }
 
-
+impl AppHost {
+    pub fn clone_node(&self) -> Node {
+        let n = self.node.try_read().unwrap();
+        n.as_ref().unwrap().clone()
+    }
+}
 
 #[uniffi::export]
 impl AppHost {
 
     #[uniffi::constructor]
     pub fn new(config: AppConfig) -> AppHost {
+        let directive: &str = config.log_directive.as_ref().map_or("ghostlib=debug", |s| s);
+
+        let filter = EnvFilter::from_default_env()
+            .add_directive(directive.parse().unwrap());
+
+        tracing_subscriber::fmt()
+            .compact()
+            .with_env_filter(filter)
+            .with_ansi(false)
+            .init();
+
         let rt = Runtime::new().expect("Unable to start a tokio runtime");
 
         let _guard = rt.enter();
@@ -85,8 +112,7 @@ impl AppHost {
         let exchange = ExchangeService::new(node.clone(), settings.clone(), identity.clone());
         let bdd = BlobDataDispatcher::new(node.clone());
 
-        println!("Created ghostlib app host");
-
+        info!("Created ghostlib app host");
         let gd = GlobalAppDispatcher::new(dispatch::global::Context {
             settings: settings.clone(),
             identity: identity.clone(),
@@ -113,11 +139,11 @@ impl AppHost {
     pub fn blob_dispatch(&self) -> Arc<BlobDataDispatcher> { self.blob_data.clone()  }
     pub fn create_establish_connection_dispatch(&self) -> Arc<EstablishConnectionDispatcher> {
         let _guard = self.handle().enter();
-        let dispatcher = EstablishConnectionDispatcher::new(dispatch::establish_connection::Context  {
+        let dispatcher = EstablishConnectionDispatcher::new(dispatch::establish::Context  {
             settings: self.settings.clone(),
             identity: self.identity.clone(),
             exchange: self.exchange.clone(),
-            ex_ctx: RwLock::new(None),
+            node: self.clone_node(),
         });
         Arc::new(dispatcher)
     }
@@ -154,21 +180,21 @@ impl AppHost {
         let lock_ref = &self.node;
 
         self.rt.block_on(async move {
-            println!("shutting down exchange service..");
+            info!("shutting down exchange service..");
             self.exchange.shutdown().await.expect("failed to shutdown contexts");
 
-            println!("Waiting for node lock...");
+            debug!("Waiting for node lock...");
             let mut lock = lock_ref.write().await;
             let owned_node = lock.take().expect("Failed to take node from option lock");
 
-            println!("Shutting down node");
+            info!("Shutting down node");
             // call on all other services to close their docs
             owned_node.shutdown().await.expect("Failed at shutting down iroh node... will crash");
-            println!("Node shutdown complete");
+            info!("Node shutdown complete");
         });
 
         if self.reset_flag.load(Relaxed) {
-            println!("Deleting all data");
+            info!("Deleting all data");
             fs::remove_dir_all(self.config.data_path.as_str()).unwrap();
         }
 
@@ -191,10 +217,16 @@ mod tests {
     use tokio::select;
     use tokio::sync::broadcast::Receiver;
 
-    use crate::data::{BlobsSerializer, ExchangeId, PublicKey};
+    use crate::data::{BlobsSerializer, ExchangeId, PublicKey, save_on_doc_as_key};
     use crate::exchange::context::{ContextEvents, ExchangeContext};
     use crate::exchange::Message;
     use crate::identity::Identification;
+    use anyhow::Result;
+    use iroh::client::docs::ShareMode;
+    use tokio::sync::mpsc;
+    use tokio::sync::mpsc::error::TryRecvError;
+    use tokio::sync::mpsc::Sender;
+    use crate::dispatch::establish::{Action, EstablishConnectionDispatchResponder, Event};
 
     // Note this useful idiom: importing names from outer (for mod tests) scope.
     use super::*;
@@ -244,7 +276,7 @@ mod tests {
         wipe_test_dir(None);
 
         fs::create_dir(TEST_DIR).unwrap();
-        let ah = AppHost::new(AppConfig { data_path: TEST_DIR.into() } );
+        let ah = AppHost::new(AppConfig::new(TEST_DIR.into()) );
         ah.set_reset_flag();
         ah.shutdown();
 
@@ -257,7 +289,7 @@ mod tests {
         wipe_test_dir(None);
 
         fs::create_dir(TEST_DIR).unwrap();
-        let ah = AppHost::new(AppConfig { data_path: TEST_DIR.into() } );
+        let ah = AppHost::new(AppConfig::new(TEST_DIR.into()) );
 
         let first = ah.handle().block_on(async {
             ah.identity.create_identification("kevin").await.unwrap();
@@ -268,7 +300,7 @@ mod tests {
 
         ah.shutdown();
 
-        let ah2 = AppHost::new(AppConfig { data_path: TEST_DIR.into() } );
+        let ah2 = AppHost::new(AppConfig::new(TEST_DIR.into()) );
         let created_name = ah2.handle().block_on(async {
             ah2.identity.load_assumed_identity().await.unwrap();
             ah2.identity.assumed_identity().await.unwrap().name
@@ -281,11 +313,11 @@ mod tests {
     #[test]
     fn create_exchange() {
         wipe_test_dir(None);
-        let ah = AppHost::new(AppConfig { data_path: TEST_DIR.into() } );
+        let ah = AppHost::new(AppConfig::new(TEST_DIR.into()) );
         ah.handle().block_on(async {
             let id = ah.identity.create_identification("kevin").await.unwrap();
             let ex = ah.exchange.create_exchange(true).await.unwrap();
-            println!("made id {}, and ex {}", id.public_key(), ex.id());
+            info!("made id {}, and ex {}", id.public_key(), ex.id());
             let zz = ah.exchange.contexts().await;
             assert_eq!(zz[0].id(), ex.id());
 
@@ -305,14 +337,14 @@ mod tests {
     #[test]
     fn exchange_persists() {
         wipe_test_dir(None);
-        let ah = AppHost::new(AppConfig { data_path: TEST_DIR.into() } );
+        let ah = AppHost::new(AppConfig::new(TEST_DIR.into()) );
         let first_exchange: ExchangeId = ah.handle().block_on(async {
             ah.identity.create_identification("kevin").await.unwrap();
             ah.exchange.create_exchange(true).await.unwrap();
             ah.exchange.contexts().await[0].id()
         });
         ah.shutdown();
-        let ah = AppHost::new(AppConfig { data_path: TEST_DIR.into() } );
+        let ah = AppHost::new(AppConfig::new(TEST_DIR.into()) );
         let second_exchange: ExchangeId = ah.handle().block_on(async {
             ah.exchange.reload_contexts(None, None).await.expect("couldn't load contexts");
             ah.exchange.contexts().await[0].id()
@@ -325,7 +357,7 @@ mod tests {
     fn creator() {
         wipe_test_dir(None);
         // first
-        let ah = AppHost::new(AppConfig { data_path: TEST_DIR.into() } );
+        let ah = AppHost::new(AppConfig::new(TEST_DIR.into()) );
 
         let (token, result) = ah.handle().block_on(async {
             ah.identity.create_identification("kevin").await.unwrap();
@@ -348,7 +380,7 @@ mod tests {
             (tkn, result)
         });
 
-        println!("alright lets interact with it");
+        info!("alright lets interact with it");
 
         ah.handle().block_on(async {
             let node: iroh::node::MemNode = iroh::node::Node::memory().spawn().await.unwrap();
@@ -376,12 +408,12 @@ mod tests {
     fn joiner() {
         wipe_test_dir(None);
         // first
-        let ah = AppHost::new(AppConfig { data_path: TEST_DIR.into() } );
+        let ah = AppHost::new(AppConfig::new(TEST_DIR.into()) );
 
         let ticket = ah.handle().block_on(async {
             let node: iroh::node::MemNode = iroh::node::Node::memory().spawn().await.unwrap();
             let doc = node.docs.create().await.unwrap();
-            println!("a doc exists at {}", doc.id());
+            info!("a doc exists at {}", doc.id());
             let author = node.authors.create().await?;
             let pk: PublicKey = author.into();
             let iden = Identification {
@@ -414,22 +446,22 @@ mod tests {
 
         ah.shutdown();
         assert_eq!(res.unwrap().name, "hurshal");
-        println!("Success!");
+        info!("Success!");
         drop(ah);
 
         // re-open with persistence helping!
-        let ah = AppHost::new(AppConfig { data_path: TEST_DIR.into() } );
+        let ah = AppHost::new(AppConfig::new(TEST_DIR.into()) );
         let names = ah.handle().block_on(async {
             ah.exchange.reload_contexts(None, None).await.expect("go");
             let ex = ah.exchange.contexts().await.remove(0);
-            println!("subscribing to worker events");
+            info!("subscribing to worker events");
             let mut sub = ex.subscribe();
-            println!("subscribed");
+            info!("subscribed");
 
             if let Ok(ContextEvents::Loaded) = sub.recv().await {
                 let mut names: Vec<String> = ex.participants().await.into_iter().map(|p|p.name).collect();
                 names.sort();
-                println!("names {:?}", names);
+                info!("names {:?}", names);
                 names
             } else {
                 vec![]
@@ -443,7 +475,7 @@ mod tests {
     #[test]
     fn sends_messages() {
         wipe_test_dir(None);
-        let ah = AppHost::new(AppConfig { data_path: TEST_DIR.into() } );
+        let ah = AppHost::new(AppConfig::new(TEST_DIR.into()) );
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(3);
 
@@ -456,7 +488,7 @@ mod tests {
             Handle::current().spawn(async move {
                 let tx = tx;
                 while let Ok(e) = subby.recv().await {
-                    println!("got event {:?}", e);
+                    info!("got event {:?}", e);
                     match e {
                        ContextEvents::MessageReceived(m)=> {
                            tx.send(m.text).await.unwrap();
@@ -479,7 +511,7 @@ mod tests {
         drop(ah);
 
         // reload from persistence!
-        let ah = AppHost::new(AppConfig { data_path: TEST_DIR.into() } );
+        let ah = AppHost::new(AppConfig::new(TEST_DIR.into()) );
         let (tx, mut rx) = tokio::sync::mpsc::channel(3);
         let ex = ah.handle().block_on(async {
             ah.exchange.reload_contexts(None, None).await.unwrap();
@@ -490,7 +522,7 @@ mod tests {
                while let Ok(e) = subby.recv().await {
                    match e {
                        ContextEvents::Loaded => {
-                           println!("my loaded messages are!! {:?}", ex_inside.messages().await)
+                           info!("my loaded messages are!! {:?}", ex_inside.messages().await)
                        }
                        ContextEvents::Join(_) => {}
                        ContextEvents::MessageReceived(m) => {
@@ -498,6 +530,7 @@ mod tests {
                        }
                        ContextEvents::LiveConnectionsUpdated(_) => {}
                        ContextEvents::FileUpdated(_) => {}
+                       ContextEvents::SyncFinished => {}
                    }
                }
             });
@@ -509,6 +542,109 @@ mod tests {
         assert_eq!("firstsecondthird", z.join(""));
         ah.shutdown();
         drop(ah);
+    }
+
+    struct Dummy {
+        tx: Sender<Event>
+    }
+    impl EstablishConnectionDispatchResponder for Dummy {
+        fn event(&self, state: Event) {
+            self.tx.try_send(state).unwrap();
+        }
+    }
+    #[test]
+    fn uses_establish() {
+        wipe_test_dir(None);
+        let ah = AppHost::new(AppConfig::new(TEST_DIR.into()) );
+        let (e_tx, mut e_rx) = tokio::sync::mpsc::channel(16);
+        let dummy = Dummy { tx: e_tx };
+
+        let node = ah.handle().block_on(async {
+            ah.identity.create_identification("kevin").await.unwrap();
+            let node: iroh::node::MemNode = iroh::node::Node::memory().spawn().await.unwrap();
+            node
+        });
+
+        let dispatch = ah.create_establish_connection_dispatch();
+        dispatch.start(Arc::new(dummy));
+
+        match e_rx.blocking_recv() {
+            Some(Event::Reset) => {
+                println!("cool")
+            }
+            val @ _ => {
+                println!("its {:?}", val);
+                panic!();
+            }
+        }
+
+        dispatch.emit_action(Action::GenerateJoinTicket);
+
+        match e_rx.blocking_recv() {
+            Some(Event::JoinTicketGenerated(tkt)) => {
+                let doc = ah.handle().block_on(async move {
+                    let author = node.authors.create().await.unwrap();
+                    let doc = node.docs.import(Ticket::deserialize(&tkt).unwrap()).await.unwrap();
+                    let other = Identification { public_key: author.into(), name: "someonelse".into() };
+                    let outcome = node.serialize_write_blob(other).await.unwrap();
+                    doc.set_hash(author, "id", outcome.hash, outcome.size).await.unwrap();
+                    doc
+                });
+            },
+            val @ _ => {
+                println!("its {:?}", val);
+                panic!();
+            }
+        }
+
+        if let Some(Event::IdentityLoaded(iden)) = e_rx.blocking_recv() {
+            assert_eq!(iden.name, "someonelse");
+        }
+
+
+    }
+
+
+    #[test]
+    fn uses_establish_otherway() {
+        wipe_test_dir(None);
+        let ah = AppHost::new(AppConfig::new(TEST_DIR.into()) );
+        let (e_tx, mut e_rx) = tokio::sync::mpsc::channel(16);
+        let dummy = Dummy { tx: e_tx };
+
+        let tk = ah.handle().block_on(async {
+            ah.identity.create_identification("kevin").await.unwrap();
+
+            let node: iroh::node::MemNode = iroh::node::Node::memory().spawn().await.unwrap();
+            let doc = node.docs.create().await.unwrap();
+            let author = node.authors.create().await.unwrap();
+            let other = Identification { public_key: author.into(), name: "someonelse".into() };
+            let outcome = node.serialize_write_blob(other).await.unwrap();
+            doc.set_hash(author, "id", outcome.hash, outcome.size).await.unwrap();
+            let dt = doc.share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses).await.unwrap();
+            Ticket::serialize(&dt)
+        });
+
+        let dispatch = ah.create_establish_connection_dispatch();
+        dispatch.start(Arc::new(dummy));
+
+        match e_rx.blocking_recv() {
+            Some(Event::Reset) => {
+                println!("cool")
+            }
+            val @ _ => {
+                println!("its {:?}", val);
+                panic!();
+            }
+        }
+
+        dispatch.emit_action(Action::ReceivedJoinTicket(tk));
+
+        if let Some(Event::IdentityLoaded(iden)) = e_rx.blocking_recv() {
+            assert_eq!(iden.name, "someonelse");
+        }
+
+
     }
 
 }

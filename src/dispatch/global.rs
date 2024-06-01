@@ -1,9 +1,10 @@
 use std::sync::Arc;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::Sender;
+use tracing::info;
+use tracing::log::debug;
 use crate::data::{BlobHash, ExchangeId, Node, WideId};
 use crate::dispatch::{AsyncMessageDispatch, EventSender, EventWrapper};
-use crate::dispatch::blob::BlobDataDispatcher;
 use crate::dispatch::EventWrapper::Event;
 use crate::dispatch::global::GlobalEvents::{ExchangeCreated, ExchangeListChanged, IdentityNeeded, IdentityPicUpdate, IdentitySelected};
 use crate::exchange::{ExchangeService, ExchangeServiceEvent, ID_PIC};
@@ -62,7 +63,7 @@ pub struct ExchangeListItem {
 
 async fn create_exchange(ctx: Arc<Context>, tx: &Sender<EventWrapper<GlobalEvents>>) -> anyhow::Result<()> {
     let e=  ctx.exchange.create_exchange(true).await?;
-    println!("created exchange {}",e.id());
+    info!("created exchange {}",e.id());
     // might not need to do this if it happens automatically by listening
     tx.send(Event(ExchangeCreated(e.id()))).await?;
     // exchange_list_changed(ctx, tx).await?;
@@ -113,7 +114,7 @@ async fn exchange_list_changed(ctx: &Arc<Context>, tx: &Sender<EventWrapper<Glob
 
     let mut disps: Vec<ExchangeListItem> = vec![];
     let ctxs = ctx.exchange.contexts().await;
-    println!("updating exchanges in ui, found {} contexts", ctxs.len());
+    debug!("updating exchanges in ui, found {} contexts", ctxs.len());
 
     for ex in ctxs {
         let maybe_other = ex.participants().await.get_other(me.public_key());
@@ -178,13 +179,13 @@ async fn action(ctx: Arc<Context>, action: GlobalActions, tx: EventSender<Global
             delete_exchange(ex_id, ctx, &tx).await?
         }
         GlobalActions::WakeFromSleep => {
-            println!("app woke from sleep");
+            info!("app woke from sleep");
             ctx.exchange.sync_all().await?;
         }
         GlobalActions::SetIdentityPic(path) => {
             let myself = ctx.identity.assumed_identity().await.unwrap();
             let hash = ctx.identity.set_pic(myself.public_key(), path).await?;
-            println!("identity pic set! hash {}", hash);
+            debug!("identity pic set! hash {}", hash);
 
             // lol does this work
             ctx.exchange.reload_pic_for_all().await?;
@@ -209,7 +210,7 @@ impl GlobalAppDispatcher {
         self.dispatch.register_responder(move |e| {
             responder.event(e);
         });
-        println!("Automatically emitting start upon register to global dispatch");
+        debug!("Automatically emitting start upon register to global dispatch");
         self.emit_action(GlobalActions::Start);
     }
 }
@@ -222,7 +223,7 @@ impl GlobalAppDispatcher {
 
         // context.exchange. // need to subscribe globally here
 
-        println!("Global app dispatch created");
+        debug!("Global app dispatch created");
         GlobalAppDispatcher {
             dispatch: message_adapter,
         }

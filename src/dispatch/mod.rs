@@ -8,11 +8,13 @@ use anyhow::Result;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::Mutex;
+use tracing::error;
 
 pub mod global;
-pub mod establish_connection;
+// pub mod establish_connection;
 pub mod exchange;
 pub mod blob;
+pub mod establish;
 
 // pub mod exchange;
 
@@ -77,7 +79,7 @@ where
                 let res = action_receiver(ctx.clone(), action, responder_tx.clone()).await;
 
                 if let Err(e) = res {
-                    eprintln!("Error handling action {}", e);
+                    error!("Error handling action {}", e);
                     responder_tx.send(EventWrapper::Error).await.expect("Error reporting error");
                 }
             }
@@ -110,7 +112,7 @@ where
                         responder(event);
                     },
                     EventWrapper::Error => {
-                        println!("I need to tell the responder something fucked up")
+                        error!("Error handling some action, TODO REPORT TO RESPONDER")
                     }
                 }
             }

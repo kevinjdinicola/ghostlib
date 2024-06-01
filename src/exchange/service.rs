@@ -11,6 +11,8 @@ use crate::identity::Service as IdentityService;
 use anyhow::{anyhow, Result};
 use iroh::base::ticket::Ticket;
 use iroh::docs::DocTicket;
+use tracing::debug;
+use uniffi::deps::log::info;
 use crate::exchange::{ID_PIC, IDENTIFICATION_KEY, SETTINGS_EXCHANGES_LIST_KEY};
 use crate::exchange::service::Events::ListDidUpdate;
 
@@ -60,7 +62,7 @@ impl Service {
         if self.broadcast.receiver_count() > 0 {
             self.broadcast.send(event)
         } else {
-            println!("ExchangeService tried to broadcast but no ones listening {:?}", event);
+            debug!("Tried to broadcast but no ones listening {:?}", event);
             Ok(0)
         }
     }
@@ -85,7 +87,7 @@ impl Service {
         }
 
         let ex_id: ExchangeId = doc.id().into();
-        println!("created doc for exchange {}, {:?}", doc.id(), doc.status().await?);
+        info!("created doc for exchange {}, {:?}", doc.id(), doc.status().await?);
 
         let ex = ExchangeContext::new(ex_id, doc, self.node.clone());
         ex.start().await?;
@@ -100,7 +102,9 @@ impl Service {
         Ok(ex)
     }
     pub async fn join_exchange(&self, join_ticket: &str, register: bool) -> Result<ExchangeContext> {
-        let join_ticket: DocTicket = Ticket::deserialize(join_ticket)?;
+        // let bytes = base64::decode(join_ticket)?;
+        // let join_ticket: DocTicket = Ticket::from_bytes(&bytes)?;
+        let join_ticket: DocTicket = Ticket::deserialize(&join_ticket)?;
         let doc = self.node.docs.import(join_ticket).await?;
         let myself = self.identity.assumed_identity().await
             .ok_or_else(|| anyhow!("cant create exchange with no assumed identity"))?;
@@ -142,7 +146,7 @@ impl Service {
             ex.sync()
         }).collect();
         futures::future::join_all(futures).await;
-        println!("did resync on all loaded exchanges");
+        info!("did resync on all loaded exchanges");
         Ok(())
     }
 
@@ -150,7 +154,7 @@ impl Service {
         let ctxs = self.contexts().await;
         let futures: Vec<_> = ctxs.iter().map(|ex| ex.shutdown()).collect();
         futures::future::join_all(futures).await;
-        println!("shut down all the contexts safely!");
+        info!("shut down all the contexts safely!");
         Ok(())
     }
 
@@ -201,7 +205,8 @@ impl Service {
                         if file.name.eq(ID_PIC) {
                             self_clone.broadcast(ListDidUpdate).await.expect("gdamnitshit");
                         }
-                    }
+                    },
+                    ContextEvents::SyncFinished => {}
                 }
             }
         });
@@ -229,7 +234,7 @@ impl Service {
 
     }
     pub async fn reload_contexts(&self, new_context: Option<ExchangeContext>, del_context: Option<ExchangeId>) -> Result<()> {
-        println!("reloading exchange contexts!");
+        info!("reloading exchange contexts!");
 
         if let Some(new) = &new_context {
             self.watch_context_changes(new.clone()).await?;
@@ -301,7 +306,7 @@ impl Service {
 
         // delete the trash
         if let Some(del_idx) = idx_to_delete {
-            println!("delete ctx at index {del_idx}");
+            debug!("delete ctx at index {del_idx}");
             (*write_lock).remove(del_idx);
         }
         self.broadcast(ListDidUpdate).await?;

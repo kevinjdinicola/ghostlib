@@ -34,6 +34,9 @@ futures-util = "0.3.30"
 flexbuffers = "2.0.0"
 async-trait = "0.1.80"
 bytes = "1.6.0"
+base64 = "0.22.1"
+tracing = "0.1.40"
+log = "0.4.21"
 
 [build-dependencies]
 uniffi_build = "0.27.1"

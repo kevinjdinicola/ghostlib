@@ -12,6 +12,7 @@ use iroh::docs::{AuthorId, NamespaceId};
 use iroh::docs::store::Query;
 use iroh::node::FsNode;
 use serde::{Deserialize, Serialize};
+use tracing::debug;
 
 // global 'store' type for how im dealing with nodes everywhere
 
@@ -152,6 +153,7 @@ pub trait BlobsSerializer {
 impl<C> BlobsSerializer for iroh::node::Node<C> {
     async fn deserialize_read_blob<T: for<'a> Deserialize<'a>>(&self, hash: Hash) -> anyhow::Result<T> {
         let bytes = self.blobs.read_to_bytes(hash).await?;
+        println!("deserialzing bytes of len {}", bytes.len());
         let r = flexbuffers::Reader::get_root(bytes.iter().as_slice()).unwrap();
         let decoded = T::deserialize(r).expect("Deserialization failed");
         Ok(decoded)

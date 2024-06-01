@@ -2,14 +2,15 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use anyhow::Result;
-use iroh::blobs::util::SetTagOption;
-use iroh::client::blobs::WrapOption;
+
+
 use iroh::client::docs::Entry;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{OnceCell, RwLock};
+use tracing::error;
 
 use crate::data::{BlobHash, Doc, load_from_doc_at_key, Node, PublicKey, save_on_doc_as_key};
-use crate::live_doc::File;
+
 use crate::settings::Service as SettingsService;
 
 const IDENTIFICATION_PREFIX: &str = "identity/identification/";
@@ -93,7 +94,7 @@ impl Service {
                 *iden_lock = Some(iden);
             }
             Err(e) => {
-                eprintln!("couldn't load an assumed identity: {e}")
+                error!("couldn't load an assumed identity: {e}")
             }
         }
         Ok(())

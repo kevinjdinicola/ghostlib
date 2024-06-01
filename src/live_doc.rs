@@ -1,19 +1,19 @@
 use std::collections::HashMap;
 
 use anyhow::Result;
-use flexbuffers::Blob;
+
 use futures_util::StreamExt;
 use iroh::blobs::Hash;
 use iroh::client::blobs::BlobStatus;
 use iroh::client::docs::{Entry, LiveEvent};
-use iroh::docs::{ContentStatus, Record};
+use iroh::docs::{ContentStatus};
 use iroh::docs::store::{Query, SortBy, SortDirection};
-use tokio::sync::mpsc::Sender;
+
 
 use crate::data::{BlobHash, BlobsSerializer, Doc, Node, PublicKey};
 use crate::exchange::Message;
 use crate::identity::Identification;
-use crate::live_doc::LiveActorEvent::{NeighborDown, NeighborUp};
+
 
 pub struct IdentificationReadWriter {
     pub key_path: &'static str,
@@ -94,6 +94,20 @@ impl IdentificationReadWriter {
     }
 
 }
+
+#[allow(async_fn_in_trait)]
+pub trait IdentificationReader {
+    async fn read(&self, hash: Hash) -> Result<Identification>;
+}
+
+impl IdentificationReader for Node {
+    async fn read(&self, hash: Hash) -> Result<Identification> {
+        self.deserialize_read_blob(hash).await
+    }
+}
+
+
+
 
 impl MessagesReadWriter {
     pub async fn get_all(&self) -> Result<Vec<Message>> {
